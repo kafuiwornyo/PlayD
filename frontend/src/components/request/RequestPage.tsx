@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Music, Disc3, CheckCircle2 } from "lucide-react";
+import { Music, Disc3, CheckCircle2, Clock, Eye, Play, SkipForward, Bookmark } from "lucide-react";
 import type { SpotifyTrack } from "@/lib/spotify";
 import { useDebounce } from "@/hooks/useDebounce";
 import { SearchBar } from "./SearchBar";
@@ -24,6 +24,18 @@ type Toast = {
   message: string;
 };
 
+type MyRequest = {
+  id: string;
+  status: string;
+  track_data: {
+    trackName?: string;
+    artistName?: string;
+    artworkUrl?: string;
+    spotifyId?: string;
+  } | null;
+  submitted_at: string;
+};
+
 function sessionKey(eventId: string) {
   return `playd:session:${eventId}`;
 }
@@ -44,6 +56,14 @@ function saveStoredSession(eventId: string, session: StoredSession) {
     // localStorage unavailable (private browsing, etc.) — proceed without persistence
   }
 }
+
+const STATUS_CONFIG: Record<string, { label: string; icon: React.ReactNode; color: string }> = {
+  pending:  { label: "Pending",  icon: <Clock className="h-3 w-3" />,        color: "text-zinc-400" },
+  seen:     { label: "Seen",     icon: <Eye className="h-3 w-3" />,          color: "text-blue-400" },
+  saved:    { label: "Saved",    icon: <Bookmark className="h-3 w-3" />,     color: "text-yellow-400" },
+  played:   { label: "Playing!", icon: <Play className="h-3 w-3" />,         color: "text-green-400" },
+  skipped:  { label: "Skipped",  icon: <SkipForward className="h-3 w-3" />, color: "text-zinc-500" },
+};
 
 export function RequestPage({ eventId, eventName }: RequestPageProps) {
   // Session state
@@ -78,6 +98,9 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
   const [eventEnded, setEventEnded] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
 
+  // My requests
+  const [myRequests, setMyRequests] = useState<MyRequest[]>([]);
+
   // ─── Session bootstrap ──────────────────────────────────────────────────────
   useEffect(() => {
     const stored = loadStoredSession(eventId);
@@ -86,7 +109,6 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
       return;
     }
 
-    // Validate stored session still exists in DB (it gets deleted when event ends)
     fetch(`/api/sessions?id=${stored.sessionId}`)
       .then((r) => r.ok ? r.json() : null)
       .then((data) => {
@@ -94,13 +116,11 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
           setSessionId(stored.sessionId);
           setDisplayName(stored.displayName);
         } else {
-          // Session was deleted (event ended and restarted, or expired) — ask for name again
           try { localStorage.removeItem(sessionKey(eventId)); } catch { /* ignore */ }
           setShowNamePrompt(true);
         }
       })
       .catch(() => {
-        // Network error — optimistically use stored session, let submit fail with proper error if needed
         setSessionId(stored.sessionId);
         setDisplayName(stored.displayName);
       });
@@ -154,6 +174,19 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
       });
   }, [eventId]);
 
+  // ─── Load this guest's requests ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!sessionId) return;
+    supabase
+      .from("requests")
+      .select("id, status, track_data, submitted_at")
+      .eq("session_id", sessionId)
+      .order("submitted_at", { ascending: false })
+      .then(({ data }) => {
+        if (data) setMyRequests(data as MyRequest[]);
+      });
+  }, [sessionId]);
+
   // ─── Supabase Realtime ──────────────────────────────────────────────────────
 
   // Keep requestedSpotifyIds live — add any song newly requested by any guest
@@ -173,18 +206,13 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
     return () => { supabase.removeChannel(channel); };
   }, [eventId]);
 
-  // Watch for the event ending so we can show the overlay mid-session
+  // Watch for the event ending
   useEffect(() => {
     const channel = supabase
       .channel(`event:status:${eventId}`)
       .on(
         "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "events",
-          filter: `id=eq.${eventId}`,
-        },
+        { event: "UPDATE", schema: "public", table: "events", filter: `id=eq.${eventId}` },
         (payload) => {
           const updated = payload.new as { status?: string };
           if (updated.status === "ended") setEventEnded(true);
@@ -195,7 +223,7 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
     return () => { supabase.removeChannel(channel); };
   }, [eventId]);
 
-  // Watch for status updates on this guest's requests
+  // Watch for status updates on this guest's requests — show toasts AND update My Requests
   useEffect(() => {
     if (!sessionId) return;
 
@@ -217,10 +245,16 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
           filter: `session_id=eq.${sessionId}`,
         },
         (payload) => {
-          const updated = payload.new as { status?: string };
+          const updated = payload.new as { id: string; status?: string };
+
+          // Update the status in My Requests list
+          setMyRequests((prev) =>
+            prev.map((r) => r.id === updated.id ? { ...r, status: updated.status ?? r.status } : r)
+          );
+
+          // Show toast
           const msg = updated.status ? STATUS_MESSAGES[updated.status] : null;
           if (!msg) return;
-
           const id = Math.random().toString(36).slice(2);
           setToasts((prev) => [...prev, { id, message: msg }]);
           setTimeout(() => {
@@ -233,7 +267,7 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
     return () => { supabase.removeChannel(channel); };
   }, [sessionId]);
 
-  // ─── Spotify search ─────────────────────────────────────────────────────────
+  // ─── Search ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!debouncedQuery.trim()) {
       setTracks([]);
@@ -277,7 +311,23 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error ?? `Request failed (${res.status})`);
       }
+      const newRequest = await res.json();
       setRequestedSpotifyIds((prev) => new Set([...prev, selectedTrack.id]));
+      // Add to My Requests immediately
+      setMyRequests((prev) => [
+        {
+          id: newRequest.id ?? Math.random().toString(36).slice(2),
+          status: "pending",
+          track_data: {
+            trackName: selectedTrack.trackName,
+            artistName: selectedTrack.artistName,
+            artworkUrl: selectedTrack.artworkUrl,
+            spotifyId: selectedTrack.id,
+          },
+          submitted_at: new Date().toISOString(),
+        },
+        ...prev,
+      ]);
       setSubmitted(true);
       setTimeout(() => { setSubmitted(false); handleClose(); }, 1800);
     } catch (err) {
@@ -323,7 +373,7 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
     );
   }
 
-  // ─── Event ended overlay (shown mid-session if DJ ends the event) ────────────
+  // ─── Event ended overlay ─────────────────────────────────────────────────────
   if (eventEnded) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-[#020202] px-6 text-center">
@@ -335,7 +385,7 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
     );
   }
 
-  // ─── Main request UI ─────────────────────────────────────────────────────────
+  // ─── Main UI ─────────────────────────────────────────────────────────────────
   return (
     <main className="min-h-screen bg-[#020202] text-white">
       <div className="pointer-events-none absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-[#b72959]/8 to-transparent" />
@@ -372,7 +422,7 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
           <SearchBar value={query} onChange={setQuery} loading={searchLoading} />
         </div>
 
-        {/* Results */}
+        {/* Search Results */}
         <div className="flex flex-col gap-3">
           {searchError && (
             <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">
@@ -419,6 +469,61 @@ export function RequestPage({ eventId, eventName }: RequestPageProps) {
             />
           ))}
         </div>
+
+        {/* ── My Requests ── */}
+        {myRequests.length > 0 && (
+          <div className="mt-10">
+            <h2 className="mb-3 text-xs font-semibold uppercase tracking-widest text-[#7f8db2]">
+              My Requests
+            </h2>
+            <div className="flex flex-col gap-2">
+              {myRequests.map((req) => {
+                const track = req.track_data;
+                const statusCfg = STATUS_CONFIG[req.status] ?? STATUS_CONFIG.pending;
+                const isTerminal = req.status === "played" || req.status === "skipped";
+                return (
+                  <div
+                    key={req.id}
+                    className={`flex items-center gap-3 rounded-2xl border p-3 transition-opacity ${
+                      isTerminal
+                        ? "border-[#1e2530] bg-[#0a0d12] opacity-50"
+                        : "border-[#2b3139] bg-[#10151d]"
+                    }`}
+                  >
+                    {/* Artwork */}
+                    {track?.artworkUrl ? (
+                      <img
+                        src={track.artworkUrl}
+                        alt={track.trackName ?? ""}
+                        className="h-11 w-11 shrink-0 rounded-lg object-cover"
+                      />
+                    ) : (
+                      <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-[#1e2530]">
+                        <Music className="h-5 w-5 text-[#5a6785]" />
+                      </div>
+                    )}
+
+                    {/* Info */}
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium text-white">
+                        {track?.trackName ?? "Unknown track"}
+                      </p>
+                      <p className="truncate text-xs text-[#7f8db2]">
+                        {track?.artistName ?? ""}
+                      </p>
+                    </div>
+
+                    {/* Status badge */}
+                    <div className={`flex shrink-0 items-center gap-1 text-xs font-medium ${statusCfg.color}`}>
+                      {statusCfg.icon}
+                      <span>{statusCfg.label}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Song detail modal */}
